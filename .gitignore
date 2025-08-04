@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.venv/
+env/
+venv/
+*.log
+
+# Archives and outputs
+*.zip
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tbz2
+*.tar.xz
+*.txz
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE/project files
+*.iml
+.idea/
+.vscode/
