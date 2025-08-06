@@ -1,18 +1,23 @@
 """
-PaxoInsight 0.2.5: Cross-platform archive extractor without external dependencies
+PaxoInsight 0.3.0: Cross-platform archive extractor without external dependencies
 -------------------------------------------------------------------------------
 
 PaxoInsight provides a graphical interface using Tkinter and optionally TkinterDnD2,
-relying solely on Python's standard library to unpack archives or analyze folders.
-It processes on selection or drag-and-drop, lists formats, highlights special files,
-supports reporting, handles nested archives up to a depth, and supports Cyrillic
-names on Windows via encoding fallbacks.
+relying solely on Python's standard library and the pure-Python `py7zr` module to unpack archives
+or analyze folders. It processes on selection or drag-and-drop, lists formats,
+highlights special files, supports reporting, handles nested archives up to a depth,
+and supports Cyrillic names on Windows via encoding fallbacks.
 
 Drag & Drop alternatives:
 - Tkdnd extension (Tcl/Tk built-in) via tkdnd load command.
 - PyQt5/PySide2 with QDragEnterEvent/QDropEvent.
 - wxPython DragAndDrop framework.
 - PySimpleGUI abstraction with DnD on supported backends.
+
+All required libraries imported below:
+- os, shutil, gzip, zipfile, tarfile, py7zr, threading
+- tkinter for UI, including scrolledtext, filedialog, messagebox
+- Optional TkinterDnD2 for Drag&Drop
 """
 
 import os
@@ -20,7 +25,15 @@ import shutil
 import gzip
 import zipfile
 import tarfile
+import py7zr
 import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+try:
+    from tkinter import scrolledtext
+except ImportError:
+    scrolledtext = None
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 try:
@@ -42,7 +55,7 @@ except ImportError:
 
 # Supported and special formats
 SUPPORTED_FORMATS = {
-    '.zip': 'zip', '.tar': 'tar', '.tar.gz': 'gztar', '.tgz': 'gztar',
+    '.zip': 'zip', '.7z': '7z', '.tar': 'tar', '.tar.gz': 'gztar', '.tgz': 'gztar',
     '.tar.bz2': 'bztar', '.tbz2': 'bztar', '.tar.xz': 'xztar', '.txz': 'xztar'
 }
 SPECIAL_EXTENSIONS = {'.jar', '.war', '.exe', '.dll', '.apk', '.ipa', '.so'}
@@ -50,7 +63,7 @@ CLASS_EXTENSION = '.class'
 REPORT_EXTENSIONS = SPECIAL_EXTENSIONS.union({CLASS_EXTENSION, '.tar.gz', '.tar.bz2', '.tar.xz', '.gz'})
 MAX_DEPTH = 5
 AUTHOR = 'DiamondGnom'
-VERSION = '0.2.5'
+VERSION = '0.3.0'
 
 class PaxoInsightApp:
     def __init__(self):
@@ -161,12 +174,21 @@ class PaxoInsightApp:
             self._process_path(folder)
 
     def _get_extension(self, path):
+        """Return the longest matching extension, checking all except '.gz' first, then '.gz' last."""
         lp = path.lower()
-        candidates = list(SUPPORTED_FORMATS.keys()) + list(SPECIAL_EXTENSIONS) + ['.gz']
-        candidates.sort(key=len, reverse=True)
-        for ext in candidates:
+        # Combine supported and special extensions
+        exts = list(SUPPORTED_FORMATS.keys()) + list(SPECIAL_EXTENSIONS)
+        # Sort by length descending, excluding '.gz'
+        exts = [e for e in exts if e != '.gz']
+        exts.sort(key=len, reverse=True)
+        # Check all except pure '.gz'
+        for ext in exts:
             if lp.endswith(ext):
                 return ext
+        # Finally, check '.gz' if nothing else matched
+        if lp.endswith('.gz'):
+            return '.gz'
+        # Fallback to simple splitext
         return os.path.splitext(path)[1].lower()
 
     def _process_path(self, path):
@@ -179,7 +201,8 @@ class PaxoInsightApp:
             self.status_label.config(text="Анализ завершён успешно")
         else:
             self.extract_dir = self._compute_extract_dir(path)
-            threading.Thread(target=self._extract_and_list, daemon=True).start()
+            thread = threading.Thread(target=self._extract_and_list, daemon=True)
+            thread.start()
 
     def _compute_extract_dir(self, path):
         lp = path.lower()
@@ -189,73 +212,111 @@ class PaxoInsightApp:
         return os.path.splitext(path)[0] + "_extracted"
 
     def _extract_and_list(self):
+        """Extract archive and recursively unpack inner archives"""
         try:
             if os.path.isdir(self.extract_dir): shutil.rmtree(self.extract_dir)
             os.makedirs(self.extract_dir)
+
             ext = self._get_extension(self.path)
-            unpacked = set()
-
-            # Handle raw gzip (.gz)
-            if ext == '.gz':
-                target = os.path.join(self.extract_dir, os.path.splitext(os.path.basename(self.path))[0])
-                with gzip.open(self.path, 'rb') as gz_in, open(target, 'wb') as out:
-                    shutil.copyfileobj(gz_in, out)
-                unpacked.add(ext)
-                os.remove(self.path)
-                self._recursive_unpack(self.extract_dir, 0, unpacked)
-
+            # 7z extraction
+            if ext == '.7z':
+                self._extract_7z(self.path, self.extract_dir)
+            # raw gzip
+            elif ext == '.gz':
+                gz_name = os.path.splitext(os.path.basename(self.path))[0]
+                target = os.path.join(self.extract_dir, gz_name)
+                with gzip.open(self.path, 'rb') as f_in, open(target, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            # zip-like
             elif ext in SPECIAL_EXTENSIONS:
-                with zipfile.ZipFile(self.path, 'r') as zf:
-                    zf.extractall(self.extract_dir)
-                unpacked.add(ext)
-                os.remove(self.path)
-                self._recursive_unpack(self.extract_dir, 0, unpacked)
-
-            elif ext in SUPPORTED_FORMATS:
+                zf = self._open_zip(self.path); zf.extractall(self.extract_dir); zf.close()
+            elif ext in SUPPORTED_FORMATS and ext != '.7z':
                 if ext.startswith('.tar'):
-                    with tarfile.open(self.path, 'r:*') as tf: tf.extractall(self.extract_dir)
+                    self._extract_tar(self.path, self.extract_dir)
                 else:
                     shutil.unpack_archive(self.path, self.extract_dir)
-                unpacked.add(ext)
-                os.remove(self.path)
-                self._recursive_unpack(self.extract_dir, 0, unpacked)
-
             else:
                 raise ValueError(f"Неподдерживаемый формат: {ext}")
+            os.remove(self.path)
+
+            unpacked = set()
+            self._recursive_unpack(self.extract_dir, 0, unpacked)
 
             formats, classes, specials = self._scan_disk(self.extract_dir)
             self.root.after(0, self._update_display, formats, classes, specials, unpacked)
             self.root.after(0, lambda: self.status_label.config(text="Распаковка завершена успешно"))
-
         except Exception as e:
-            self.root.after(0, lambda: self.status_label.config(text=f"Ошибка: {e}"))
-            self.root.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            self.root.after(0, lambda: [self.status_label.config(text=f"Ошибка: {e}"), messagebox.showerror("Ошибка", str(e))])
+
+    def _open_zip(self, path):
+        try:
+            return zipfile.ZipFile(path, 'r', encoding='cp866')
+        except TypeError:
+            return zipfile.ZipFile(path, 'r')
+
+    def _extract_tar(self, path, dest):
+        """Extract tar archives with any compression"""
+        try:
+            with tarfile.open(path, 'r:*') as tf:
+                tf.extractall(dest)
+        except Exception:
+            with tarfile.open(path, 'r') as tf:
+                tf.extractall(dest)
+
+    def _extract_7z(self, path, dest):
+        """Extract a .7z archive using py7zr library"""
+        try:
+            with py7zr.SevenZipFile(path, mode='r') as archive:
+                archive.extractall(path=dest)
+        except Exception as e:
+            messagebox.showerror("Ошибка 7z", f"Не удалось распаковать {path}: {e}")
 
     def _recursive_unpack(self, directory, depth, unpacked):
-        if depth >= MAX_DEPTH: return
+        """Recursively unpack inner archives up to MAX_DEPTH"""
+        if depth >= MAX_DEPTH:
+            return
         for root, _, files in os.walk(directory):
-            if '__MACOSX' in root: continue
+            if '__MACOSX' in root:
+                continue
             for f in files:
-                if f.startswith('._'): continue
+                if f.startswith('._'):
+                    continue
                 full = os.path.join(root, f)
                 iext = self._get_extension(full)
-                if iext in SPECIAL_EXTENSIONS or iext in SUPPORTED_FORMATS or iext == '.gz':
-                    target = full[:-len(iext)]
-                    try:
-                        if iext == '.gz':
-                            with gzip.open(full, 'rb') as gz_in, open(target, 'wb') as out:
-                                shutil.copyfileobj(gz_in, out)
-                        elif iext in SPECIAL_EXTENSIONS:
-                            with zipfile.ZipFile(full, 'r') as zf: zf.extractall(target)
-                        elif iext.startswith('.tar'):
-                            with tarfile.open(full, 'r:*') as tf: tf.extractall(target)
+                try:
+                    if iext == '.gz':
+                        gz_name = os.path.splitext(f)[0]
+                        target = os.path.join(root, gz_name)
+                        with gzip.open(full, 'rb') as f_in, open(target, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                        unpacked.add(iext)
+                        os.remove(full)
+                        self._recursive_unpack(root, depth+1, unpacked)
+                    elif iext == '.7z':
+                        target = full[:-len(iext)]
+                        self._extract_7z(full, target)
+                        unpacked.add(iext)
+                        os.remove(full)
+                        self._recursive_unpack(target, depth+1, unpacked)
+                    elif iext in SPECIAL_EXTENSIONS:
+                        target = full[:-len(iext)]
+                        zf = self._open_zip(full)
+                        zf.extractall(target)
+                        zf.close()
+                        unpacked.add(iext)
+                        os.remove(full)
+                        self._recursive_unpack(target, depth+1, unpacked)
+                    elif iext in SUPPORTED_FORMATS:
+                        target = full[:-len(iext)]
+                        if iext.startswith('.tar'):
+                            self._extract_tar(full, target)
                         else:
                             shutil.unpack_archive(full, target)
                         unpacked.add(iext)
                         os.remove(full)
                         self._recursive_unpack(target, depth+1, unpacked)
-                    except Exception:
-                        continue
+                except Exception:
+                    continue
 
     def _scan_disk(self, directory):
         exts, classes, specials = set(), [], []
@@ -279,7 +340,8 @@ class PaxoInsightApp:
         self.text_display.delete('1.0', tk.END)
         if classes:
             self.text_display.insert(tk.END, "Обнаружены .class-файлы:\n")
-            for c in classes: self.text_display.insert(tk.END, f"  {c}\n")
+            for c in classes:
+                self.text_display.insert(tk.END, f"  {c}\n")
             self.text_display.insert(tk.END, "\n")
         if specials:
             self.text_display.insert(tk.END, "Сборка кода/приложения:\n")
@@ -313,5 +375,9 @@ class PaxoInsightApp:
                     rf.write(f"* -> {ext}\n")
         messagebox.showinfo("Готово", f"Отчет сохранен: {rpt}")
 
-if __name__ == "__main__":
+
+def main():
     PaxoInsightApp()
+
+if __name__ == "__main__":
+    main()
